@@ -97,23 +97,32 @@ class BenchmarkResult:
         self._timestamps = []
         self.time_to_first_token = []
         self.inter_token_latency = []
+        self.per_token_latency = []
+        self.per_token_avg_throughput = []
+        self.per_token_gpu_memory_gb = []
         self.shape_and_decoded_outputs = []
         self.gpu_metrics = []
 
     def accumulate(
         self,
         e2e_latency: float,
-        timestamps: list[float],
+        timestamps: list[list[float]],
+        per_token_latency: list[list[float]],
+        per_token_avg_throughput: list[list[float]],
+        per_token_gpu_memory_gb: list[list[float]],
         shape_and_decoded_output: str,
         gpu_metrics: GPURawMetrics | None,
     ) -> None:
         self.e2e_latency.append(e2e_latency)
         self._timestamps.append(timestamps)
         self._accumulate_ttft_and_itl(timestamps)
+        self.per_token_latency.append(per_token_latency)
+        self.per_token_avg_throughput.append(per_token_avg_throughput)
+        self.per_token_gpu_memory_gb.append(per_token_gpu_memory_gb)
         self.shape_and_decoded_outputs.append(shape_and_decoded_output)
         self.gpu_metrics.append(gpu_metrics)
 
-    def _accumulate_ttft_and_itl(self, timestamps: list[float]) -> None:
+    def _accumulate_ttft_and_itl(self, timestamps: list[list[float]]) -> None:
         timestamps = np.array(timestamps)
         tftt = np.min(timestamps[:, 0])
         itl = np.mean(timestamps[:, -1] - timestamps[:, 0]) / (timestamps.shape[1] - 1)
@@ -130,6 +139,9 @@ class BenchmarkResult:
             "e2e_latency": self.e2e_latency,
             "time_to_first_token": self.time_to_first_token,
             "inter_token_latency": self.inter_token_latency,
+            "per_token_latency": self.per_token_latency,
+            "per_token_avg_throughput": self.per_token_avg_throughput,
+            "per_token_gpu_memory_gb": self.per_token_gpu_memory_gb,
             "shape_and_decoded_outputs": self.shape_and_decoded_outputs,
             "gpu_metrics": gpu_metrics,
             "timestamps": None if summarized else self._timestamps,
@@ -147,12 +159,24 @@ class BenchmarkResult:
             timestamps = [None for _ in range(len(data["e2e_latency"]))]
         else:
             timestamps = data["timestamps"]
+        per_token_latency = data.get("per_token_latency")
+        if per_token_latency is None:
+            per_token_latency = [None for _ in range(len(data["e2e_latency"]))]
+        per_token_avg_throughput = data.get("per_token_avg_throughput")
+        if per_token_avg_throughput is None:
+            per_token_avg_throughput = [None for _ in range(len(data["e2e_latency"]))]
+        per_token_gpu_memory_gb = data.get("per_token_gpu_memory_gb")
+        if per_token_gpu_memory_gb is None:
+            per_token_gpu_memory_gb = [None for _ in range(len(data["e2e_latency"]))]
         # Create a new instance and accumulate the data
         new_instance = cls()
         new_instance.e2e_latency = data["e2e_latency"]
         new_instance._timestamps = timestamps
         new_instance.time_to_first_token = data["time_to_first_token"]
         new_instance.inter_token_latency = data["inter_token_latency"]
+        new_instance.per_token_latency = per_token_latency
+        new_instance.per_token_avg_throughput = per_token_avg_throughput
+        new_instance.per_token_gpu_memory_gb = per_token_gpu_memory_gb
         new_instance.shape_and_decoded_outputs = data["shape_and_decoded_outputs"]
         new_instance.gpu_metrics = gpu_metrics
         return new_instance
