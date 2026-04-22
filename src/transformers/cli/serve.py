@@ -357,6 +357,15 @@ class TimedModel:
         return not hasattr(self, "model") or self.model is None
 
 
+def _get_gpu_mem() -> float:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.max_memory_allocated() / (1024 ** 3)
+    except Exception:
+        pass
+    return 0.0
+
 class Serve:
     # Defining a class to help with internal state but in practice it's just a method to call
     # TODO: refactor into a proper module with helpers + 1 main method
@@ -713,7 +722,7 @@ class Serve:
         return chunk
 
     @staticmethod
-    def chunk_to_sse_element(chunk: ChatCompletionChunk | BaseModel) -> str:
+    def chunk_to_sse_element(chunk: ChatCompletionChunk | BaseModel | dict | tuple) -> str:
         """
         Builds an event of a streaming OpenAI Response model or a ChatCompletion chunk.
 
@@ -721,12 +730,22 @@ class Serve:
         like Cursor, assume that when the field exists, it has data.
 
         Args:
-            chunk (`BaseModel` or `ChatCompletionChunk`):
+            chunk (`BaseModel`, `ChatCompletionChunk`, `dict`, or `tuple`):
                 The response to build an event from. One of the multiple OpenAI Response output types
 
         Returns:
             `str`: The built chunk, a string containing a JSON string with the payload.
         """
+        if isinstance(chunk, tuple):
+            chunk_obj, metrics = chunk
+            chunk_dict = chunk_obj.model_dump(exclude_none=True) if hasattr(chunk_obj, "model_dump") else chunk_obj
+            if metrics:
+                chunk_dict["metrics"] = metrics
+            chunk = chunk_dict
+
+        if isinstance(chunk, dict):
+            import json
+            return f"data: {json.dumps(chunk)}\n\n"
         return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     @staticmethod
@@ -833,11 +852,31 @@ class Serve:
             try:
                 # Emit the assistant role to start the stream. Other chunks won't have a role, as it is implicit
                 # they come from the assistant.
-                yield self.build_chat_completion_chunk(request_id, role="assistant", model=model_id_and_revision)
+                yield self.build_chat_completion_chunk(request_id, role="assistant", model=model_id_and_revision), None
 
                 n_tokens_generated = 0
+                import time
+                start_time = time.time()
+                last_time = start_time
+
                 for result in self.running_continuous_batching_manager.request_id_iter(request_id):
+                    current_time = time.time()
+                    token_time = current_time - last_time
+                    last_time = current_time
+                    gpu_mem = _get_gpu_mem()
                     n_tokens_generated += 1
+                    
+                    elapsed_time = current_time - start_time
+                    avg_throughput = n_tokens_generated / elapsed_time if elapsed_time > 0 else 0.0
+                    avg_latency = elapsed_time / n_tokens_generated if n_tokens_generated > 0 else 0.0
+                    
+                    metrics = {
+                        "generated_tokens": n_tokens_generated,
+                        "per_token_gen_time": [token_time],
+                        "per_token_gpu_mem": [gpu_mem],
+                        "avg_throughput_to_now": [avg_throughput],
+                        "avg_latency_to_now": [avg_latency]
+                    }
 
                     # Always yield the token content (even for the final FINISHED token)
                     if result.generated_tokens:
@@ -848,7 +887,7 @@ class Serve:
                             model=model_id_and_revision,
                             decode_stream=decode_stream,
                             tokenizer=tokenizer,
-                        )
+                        ), metrics
 
                     if result.status == RequestStatus.FINISHED:
                         generated_all_tokens = n_tokens_generated >= generation_config.max_new_tokens
@@ -864,13 +903,13 @@ class Serve:
                             request_id,
                             finish_reason=reason,
                             model=model_id_and_revision,
-                        )
+                        ), metrics
                         break
 
             except Exception as e:
                 logger.error(str(e))
                 self.running_continuous_batching_manager.cancel_request(request_id)
-                yield f'data: {{"error": "{str(e)}"}}'
+                yield f'data: {{"error": "{str(e)}"}}', None
 
         def buffer_chat_completion(_request_id):
             result = None
@@ -1097,13 +1136,33 @@ class Serve:
 
                 # Emit the assistant role to start the stream. Other chunks won't have a role, as it is implicit
                 # they come from the assistant.
-                yield self.build_chat_completion_chunk(request_id, role="assistant", model=model_id_and_revision)
+                yield self.build_chat_completion_chunk(request_id, role="assistant", model=model_id_and_revision), None
 
                 result = ""
                 n_tokens_generated = 0
+                import time
+                start_time = time.time()
+                last_time = start_time
 
                 for result in streamer:
+                    current_time = time.time()
+                    token_time = current_time - last_time
+                    last_time = current_time
+                    
+                    gpu_mem = _get_gpu_mem()
                     n_tokens_generated += 1
+                    
+                    elapsed_time = current_time - start_time
+                    avg_throughput = n_tokens_generated / elapsed_time if elapsed_time > 0 else 0.0
+                    avg_latency = elapsed_time / n_tokens_generated if n_tokens_generated > 0 else 0.0
+                    
+                    metrics = {
+                        "generated_tokens": n_tokens_generated,
+                        "per_token_gen_time": [token_time],
+                        "per_token_gpu_mem": [gpu_mem],
+                        "avg_throughput_to_now": [avg_throughput],
+                        "avg_latency_to_now": [avg_latency]
+                    }
 
                     # Temporary hack for GPT-OSS 3: don't emit the final "<|return|>"
                     if "gptoss" in model.config.architectures[0].lower():
@@ -1133,7 +1192,7 @@ class Serve:
                                 role=None,
                                 finish_reason="tool_calls",
                                 model=model_id_and_revision,
-                            )
+                            ), metrics
 
                             continue
                         # Inside a tool call
@@ -1185,7 +1244,7 @@ class Serve:
                                 role=None,
                                 tool_calls=[tool],
                                 model=model_id_and_revision,
-                            )
+                            ), metrics
                             continue
                     # ====== END OF TOOL CALL LOGIC ======
 
@@ -1193,7 +1252,7 @@ class Serve:
                     if result != "":
                         yield self.build_chat_completion_chunk(
                             _request_id, content=result, model=model_id_and_revision
-                        )
+                        ), metrics
 
                 generated_all_tokens = n_tokens_generated >= generation_config.max_new_tokens
 
@@ -1204,12 +1263,15 @@ class Serve:
 
                 reason = "length" if generated_all_tokens else "stop"
 
-                yield self.build_chat_completion_chunk(_request_id, finish_reason=reason, model=model_id_and_revision)
+                # End token has empty metrics or we can re-use the last metrics. Let's reuse last metrics or None.
+                # Actually, wait. The prompt says "生成每个token时返回". For the finish chunk, there's no new token, but we need to return a tuple anyway.
+                final_metrics = metrics if 'metrics' in locals() else None
+                yield self.build_chat_completion_chunk(_request_id, finish_reason=reason, model=model_id_and_revision), final_metrics
 
                 thread.join()
             except Exception as e:
                 logger.error(str(e))
-                yield f'data: {{"error": "{str(e)}"}}'
+                yield f'data: {{"error": "{str(e)}"}}', None
 
             finally:
                 thread.join()
@@ -1225,8 +1287,29 @@ class Serve:
 
             generator = stream_chat_completion(generation_streamer, request_id)
             usage = None
+            
+            # Aggregate metrics
+            agg_metrics = {
+                "generated_tokens": 0,
+                "per_token_gen_time": [],
+                "per_token_gpu_mem": [],
+                "avg_throughput_to_now": [],
+                "avg_latency_to_now": []
+            }
 
-            for chunk in generator:
+            for chunk_tuple in generator:
+                chunk, metrics = chunk_tuple
+                
+                if metrics:
+                    agg_metrics["generated_tokens"] = metrics["generated_tokens"]
+                    agg_metrics["per_token_gen_time"].extend(metrics["per_token_gen_time"])
+                    agg_metrics["per_token_gpu_mem"].extend(metrics["per_token_gpu_mem"])
+                    agg_metrics["avg_throughput_to_now"].extend(metrics["avg_throughput_to_now"])
+                    agg_metrics["avg_latency_to_now"].extend(metrics["avg_latency_to_now"])
+                
+                if isinstance(chunk, str):
+                    continue
+
                 choice = chunk.choices[0]
                 if getattr(choice.delta, "content", None):
                     content.append(choice.delta.content)
@@ -1253,6 +1336,8 @@ class Serve:
             )
 
             result = chat_completion_result.model_dump(exclude_none=True)
+            if agg_metrics["generated_tokens"] > 0:
+                result["metrics"] = agg_metrics
 
             return JSONResponse(result, media_type="application/json")
 

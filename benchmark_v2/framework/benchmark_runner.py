@@ -239,24 +239,10 @@ class BenchmarkRunner:
             result = BenchmarkResult()
             self.logger.info(f"Benchmarking with {config.measurement_iterations} iterations.")
             for _ in trange(config.measurement_iterations, desc="Benchmarking"):
-                (
-                    e2e_latency,
-                    timestamps,
-                    per_token_latency,
-                    per_token_avg_throughput,
-                    per_token_gpu_memory_gb,
-                    shape_and_decoded_output,
-                    gpu_metrics,
-                ) = self.time_generate(config, warmup=False)
-                result.accumulate(
-                    e2e_latency=e2e_latency,
-                    timestamps=timestamps,
-                    per_token_latency=per_token_latency,
-                    per_token_avg_throughput=per_token_avg_throughput,
-                    per_token_gpu_memory_gb=per_token_gpu_memory_gb,
-                    shape_and_decoded_output=shape_and_decoded_output,
-                    gpu_metrics=gpu_metrics,
+                e2e_latency, timestamps, shape_and_decoded_output, gpu_metrics = self.time_generate(
+                    config, warmup=False
                 )
+                result.accumulate(e2e_latency, timestamps, shape_and_decoded_output, gpu_metrics)
             self.logger.info("Benchmarking done. Cleaning up.")
 
             # Profile if needed
@@ -267,8 +253,9 @@ class BenchmarkRunner:
 
     def time_generate(
         self, config: BenchmarkConfig, warmup: bool
-    ) -> tuple[float, list[list[float]], list[list[float]], list[list[float]], list[list[float]], str, GPURawMetrics | None]:
-        if not warmup:
+    ) -> tuple[float, list[float], str, GPURawMetrics | None]:
+        # Prepare gpu monitoring if needed
+        if config.gpu_monitoring and not warmup:
             gpu_monitor = GPUMonitor(logger=self.logger)
             gpu_monitor.start()
         else:
@@ -278,17 +265,14 @@ class BenchmarkRunner:
         if config.continuous_batching:
             inputs = self.inputs["input_ids"].tolist()
             wall_time_0 = time.perf_counter()
-            wall_time_0_time = time.time()
             outputs = self.model.generate_batch(inputs, allow_block_sharing=False, record_timestamps=True)
         else:
             streamer = BenchmarkStreamer()
             wall_time_0 = time.perf_counter()
-            wall_time_0_time = time.time()
             outputs = self.model.generate(**self.inputs, streamer=streamer)
 
         wall_time_1 = time.perf_counter()
-        token_gpu_metrics = gpu_monitor.stop_and_collect() if gpu_monitor is not None else None
-        gpu_metrics = token_gpu_metrics if config.gpu_monitoring else None
+        gpu_metrics = gpu_monitor.stop_and_collect() if gpu_monitor is not None else None
 
         # Retrieve timestamps and results in a way that allows similar post-processing
         input_tokens = self.inputs["input_ids"].size(-1)
@@ -312,69 +296,10 @@ class BenchmarkRunner:
         # Compute metrics
         e2e_latency = wall_time_1 - wall_time_0
         timestamps = torch.tensor(timestamps).sub(wall_time_0).tolist()
-        per_token_latency, per_token_avg_throughput = self._compute_per_token_fields(timestamps)
-        per_token_gpu_memory_gb = self._compute_per_token_gpu_memory_gb(
-            timestamps=timestamps,
-            gpu_metrics=token_gpu_metrics,
-            wall_time_0_time=wall_time_0_time,
-        )
         self.logger.info(
             f"Time generate done in {e2e_latency:.2f} seconds. Memory usage: {self.torch_accelerator_module.memory_allocated() / 1024**2:.2f} MB"
         )
-        return (
-            e2e_latency,
-            timestamps,
-            per_token_latency,
-            per_token_avg_throughput,
-            per_token_gpu_memory_gb,
-            shape_and_decoded_output,
-            gpu_metrics,
-        )
-
-    @staticmethod
-    def _compute_per_token_fields(timestamps: list[list[float]]) -> tuple[list[list[float]], list[list[float]]]:
-        per_token_latency = []
-        per_token_avg_throughput = []
-        for sequence_timestamps in timestamps:
-            sequence_latency = []
-            sequence_avg_throughput = []
-            previous_timestamp = 0.0
-            for index, current_timestamp in enumerate(sequence_timestamps):
-                token_latency = max(current_timestamp - previous_timestamp, 0.0)
-                average_throughput = (index + 1) / current_timestamp if current_timestamp > 0 else 0.0
-                sequence_latency.append(round(token_latency, 2))
-                sequence_avg_throughput.append(round(average_throughput, 2))
-                previous_timestamp = current_timestamp
-            per_token_latency.append(sequence_latency)
-            per_token_avg_throughput.append(sequence_avg_throughput)
-        return per_token_latency, per_token_avg_throughput
-
-    def _compute_per_token_gpu_memory_gb(
-        self, timestamps: list[list[float]], gpu_metrics: GPURawMetrics | None, wall_time_0_time: float
-    ) -> list[list[float]]:
-        fallback_memory_gb = round(self.torch_accelerator_module.memory_allocated() / 1024**3, 2)
-        if (
-            gpu_metrics is None
-            or len(gpu_metrics.memory_used) == 0
-            or len(gpu_metrics.timestamps) == 0
-            or len(gpu_metrics.memory_used) != len(gpu_metrics.timestamps)
-        ):
-            return [[fallback_memory_gb for _ in sequence_timestamps] for sequence_timestamps in timestamps]
-
-        gpu_sample_absolute_times = [gpu_metrics.timestamp_0 + ts for ts in gpu_metrics.timestamps]
-        gpu_sample_memory = gpu_metrics.memory_used
-        per_token_gpu_memory_gb = []
-        for sequence_timestamps in timestamps:
-            sequence_memory = []
-            for token_timestamp in sequence_timestamps:
-                token_absolute_time = wall_time_0_time + token_timestamp
-                nearest_sample_index = min(
-                    range(len(gpu_sample_absolute_times)),
-                    key=lambda idx: abs(gpu_sample_absolute_times[idx] - token_absolute_time),
-                )
-                sequence_memory.append(round(float(gpu_sample_memory[nearest_sample_index]), 2))
-            per_token_gpu_memory_gb.append(sequence_memory)
-        return per_token_gpu_memory_gb
+        return e2e_latency, timestamps, shape_and_decoded_output, gpu_metrics
 
     def profile_generate(self, num_tokens_to_profile: int, config_name: str) -> None:
         """Profile the latency of a call to model.generate() with the given (inputs) and (max_new_tokens)."""
